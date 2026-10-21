@@ -117,3 +117,7 @@ CMakeUserPresets.json
 /cache0
 /devkit
 recent.toml
+
+# Claude Code phone tooling output (logs, configs, crash reports from the iPhone)
+.phone/
+CLAUDE.local.md

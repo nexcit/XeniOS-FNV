@@ -1,0 +1,128 @@
+# iOS dev build for a personal XeniOS fork.
+#
+# Builds an ad-hoc-signed IPA on a GitHub macOS runner using XeniOS's own
+# tools/build_apple_release.sh (no official signing/attestation keys needed),
+# then publishes it to a rolling pre-release called "dev-latest" so the IPA
+# can be downloaded straight from Safari on the iPhone and opened in SideStore.
+#
+# Trigger from Claude Code:   gh workflow run ios-dev-build.yml --ref <branch>
+# Or automatically:           push to any branch named dev/...
+
+name: iOS dev build
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: "What this build is testing (shown in the release notes)"
+        required: false
+        default: ""
+  push:
+    branches:
+      - "dev/**"
+
+concurrency:
+  group: ios-dev-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Bundle ID baked into the IPA. SideStore appends your team ID when it signs.
+  #  - "com.xenios.dev": installs NEXT TO the official XeniOS app (separate
+  #    Documents folder, so copy games into it). Uses one extra app slot.
+  #  - "com.xenios.jp": installs OVER the official XeniOS app and keeps its
+  #    games/config. Use this if you're at the free-account app limit.
+  IOS_BUNDLE_ID: "com.xenios.dev"
+
+jobs:
+  build-ios:
+    name: Build iOS IPA
+    runs-on: macos-15
+    timeout-minutes: 150
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Same dependency setup as upstream .github/workflows/apple-publish.yml
+      - name: Set up Apple build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          retry() {
+            local attempts=0
+            until "$@"; do
+              attempts=$((attempts + 1))
+              if [ "$attempts" -ge 5 ]; then return 1; fi
+              sleep 5
+            done
+          }
+          brew install ninja
+          retry git submodule update --init --depth=1 --recursive -j"$(sysctl -n hw.ncpu)"
+          retry git -C third_party/DirectXShaderCompiler submodule update --init --depth=1 \
+            external/SPIRV-Headers external/SPIRV-Tools
+          ./xenia-build.py fetchdata
+
+      - name: Select Xcode 26.3
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
+
+      - name: Ensure Metal toolchain
+        shell: bash
+        run: |
+          if xcrun -sdk iphoneos metal --version >/dev/null 2>&1; then
+            echo "Metal toolchain already present"; exit 0
+          fi
+          for attempt in 1 2 3 4 5; do
+            if sudo xcodebuild -downloadComponent MetalToolchain; then exit 0; fi
+            echo "::warning::MetalToolchain download attempt $attempt failed"
+            sleep $((attempt * 30))
+          done
+          echo "::error::MetalToolchain download failed"; exit 1
+
+      - name: Build IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./tools/build_apple_release.sh \
+            --config release \
+            --channel preview \
+            --stage alpha \
+            --ios-bundle-id "${IOS_BUNDLE_ID}" \
+            --skip-macos-arm64 --skip-macos-x86_64 --skip-macos-universal
+          short_sha="$(git rev-parse --short HEAD)"
+          mkdir -p out
+          cp scratch/artifacts/xenios_ios_iphone_ipad.ipa "out/XeniOS-dev-${short_sha}.ipa"
+          echo "SHORT_SHA=${short_sha}" >> "$GITHUB_ENV"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: XeniOS-dev-${{ env.SHORT_SHA }}
+          path: out/XeniOS-dev-${{ env.SHORT_SHA }}.ipa
+          retention-days: 7
+
+      - name: Publish rolling "dev-latest" pre-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTE: ${{ github.event.inputs.note }}
+        run: |
+          set -euo pipefail
+          gh release delete dev-latest --yes --cleanup-tag 2>/dev/null || true
+          {
+            echo "Branch: ${GITHUB_REF_NAME}"
+            echo "Commit: ${SHORT_SHA}"
+            echo "Built: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            if [ -n "${NOTE}" ]; then echo; echo "Testing: ${NOTE}"; fi
+            echo
+            git log -5 --format='- %h %s'
+          } > notes.md
+          # Fixed file name so the phone can always use the same download link.
+          cp "out/XeniOS-dev-${SHORT_SHA}.ipa" out/XeniOS-dev.ipa
+          gh release create dev-latest out/XeniOS-dev.ipa \
+            --prerelease \
+            --target "${GITHUB_SHA}" \
+            --title "Dev build ${SHORT_SHA} (${GITHUB_REF_NAME})" \
+            --notes-file notes.md
+          echo "IPA: https://github.com/${GITHUB_REPOSITORY}/releases/download/dev-latest/XeniOS-dev.ipa" >> "$GITHUB_STEP_SUMMARY"
