@@ -58,7 +58,7 @@ jobs:
               sleep 5
             done
           }
-          brew install ninja
+          brew install ninja ccache
           retry git submodule update --init --depth=1 --recursive -j"$(sysctl -n hw.ncpu)"
           retry git -C third_party/DirectXShaderCompiler submodule update --init --depth=1 \
             external/SPIRV-Headers external/SPIRV-Tools
@@ -80,10 +80,104 @@ jobs:
           done
           echo "::error::MetalToolchain download failed"; exit 1
 
-      - name: Build IPA
+      # Build caches. Runs can restore caches from their own branch or from
+      # the default branch, so a workflow_dispatch build on xenios warms them
+      # for every dev/** branch.
+      #  - ccache for C/C++ compiles. CMake's compiler launchers don't apply
+      #    to the Xcode generator, so XCODE_XCCONFIG_FILE sets Xcode's own
+      #    C_COMPILER_LAUNCHER instead (the host Ninja build uses CMake's).
+      #  - The prebuilt libdxilconv.dylib (nested DXC/LLVM build, ~10 min).
+      #  - CMake configure results (~7 min of feature checks with Xcode).
+      - name: Set up build caches
+        id: cache-setup
         shell: bash
         run: |
           set -euo pipefail
+          ccache_dir="${RUNNER_TEMP}/ccache"
+          sloppiness="pch_defines,time_macros,include_file_mtime,include_file_ctime,modules,clang_index_store,ivfsoverlay,system_headers"
+          mkdir -p "$ccache_dir"
+          {
+            echo "CCACHE_DIR=${ccache_dir}"
+            echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
+            echo "CCACHE_SLOPPINESS=${sloppiness}"
+            echo "CCACHE_MAXSIZE=2G"
+            echo "CMAKE_C_COMPILER_LAUNCHER=ccache"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          } >> "$GITHUB_ENV"
+
+          # Xcode doesn't reliably pass the job environment to compiler
+          # invocations, so the launcher carries absolute paths and settings.
+          # Modules and response files are off: ccache can't cache them, and
+          # XeniOS doesn't use clang modules.
+          wrapper_dir="${RUNNER_TEMP}/ccache-xcode"
+          mkdir -p "$wrapper_dir"
+          {
+            echo '#!/bin/sh'
+            echo "export CCACHE_DIR='${ccache_dir}' CCACHE_BASEDIR='${GITHUB_WORKSPACE}'"
+            echo "export CCACHE_SLOPPINESS='${sloppiness}' CCACHE_MAXSIZE=2G"
+            echo "exec '$(command -v ccache)' \"\$@\""
+          } > "${wrapper_dir}/ccache-launcher"
+          chmod +x "${wrapper_dir}/ccache-launcher"
+          {
+            echo "C_COMPILER_LAUNCHER = ${wrapper_dir}/ccache-launcher"
+            echo "CXX_COMPILER_LAUNCHER = ${wrapper_dir}/ccache-launcher"
+            echo "CLANG_ENABLE_MODULES = NO"
+            echo "CLANG_USE_RESPONSE_FILE = NO"
+            echo "COMPILER_INDEX_STORE_ENABLE = NO"
+          } > "${wrapper_dir}/ccache.xcconfig"
+          echo "XCODE_XCCONFIG_FILE=${wrapper_dir}/ccache.xcconfig" >> "$GITHUB_ENV"
+
+          short_hash() { shasum -a 256 | cut -c1-16; }
+          toolchain="$({ xcodebuild -version; cmake --version | head -1; uname -m; } | short_hash)"
+          # CMake's checks depend on the build files and every submodule.
+          cmake_inputs="$({ git ls-files -s | awk -F'\t' '$2 ~ /(^|\/)CMakeLists\.txt$|\.cmake$|^CMakePresets\.json$|^xenia-build\.py$/'; git ls-tree -r HEAD third_party | awk '$1 == "160000"'; } | short_hash)"
+          dxilconv_inputs="$({ git ls-tree HEAD third_party/DirectXShaderCompiler third_party/DirectX-Headers; git ls-files -s CMakeLists.txt third_party/CMakeLists.txt; } | short_hash)"
+          {
+            echo "toolchain=${toolchain}"
+            echo "cmake=${cmake_inputs}"
+            echo "dxilconv=${dxilconv_inputs}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Toolchain ${toolchain}, CMake inputs ${cmake_inputs}, dxilconv inputs ${dxilconv_inputs}"
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-ios-${{ steps.cache-setup.outputs.toolchain }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-ios-${{ steps.cache-setup.outputs.toolchain }}-${{ github.ref_name }}-
+            ccache-ios-${{ steps.cache-setup.outputs.toolchain }}-
+
+      - name: Restore prebuilt dxilconv
+        id: dxilconv-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: third_party/DirectXShaderCompiler/build_dxilconv_ios/lib/libdxilconv.dylib
+          key: dxilconv-ios-${{ steps.cache-setup.outputs.toolchain }}-${{ steps.cache-setup.outputs.dxilconv }}
+
+      - name: Restore CMake configure results
+        id: cmake-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build/CMakeCache.txt
+            build/CMakeFiles/[0-9]*
+            build-ios-xcode/CMakeCache.txt
+            build-ios-xcode/CMakeFiles/[0-9]*
+          key: cmake-ios-${{ steps.cache-setup.outputs.toolchain }}-${{ steps.cache-setup.outputs.cmake }}
+
+      # The checkout is newer than the restored dylib, which would make the
+      # dxilconv custom command rebuild it from scratch.
+      - name: Mark restored dxilconv as up to date
+        if: steps.dxilconv-cache.outputs.cache-hit == 'true'
+        run: touch third_party/DirectXShaderCompiler/build_dxilconv_ios/lib/libdxilconv.dylib
+
+      - name: Build IPA
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          ccache --zero-stats
           ./tools/build_apple_release.sh \
             --config release \
             --channel preview \
@@ -95,6 +189,35 @@ jobs:
           cp scratch/artifacts/xenios_ios_iphone_ipad.ipa "out/XeniOS-dev-${short_sha}.ipa"
           echo "SHORT_SHA=${short_sha}" >> "$GITHUB_ENV"
 
+      - name: Compiler cache stats
+        if: always()
+        run: ccache --show-stats || true
+
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ccache-ios-${{ steps.cache-setup.outputs.toolchain }}-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save prebuilt dxilconv
+        if: always() && steps.dxilconv-cache.outputs.cache-hit != 'true' && hashFiles('third_party/DirectXShaderCompiler/build_dxilconv_ios/lib/libdxilconv.dylib') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: third_party/DirectXShaderCompiler/build_dxilconv_ios/lib/libdxilconv.dylib
+          key: dxilconv-ios-${{ steps.cache-setup.outputs.toolchain }}-${{ steps.cache-setup.outputs.dxilconv }}
+
+      - name: Save CMake configure results
+        if: always() && steps.cmake-cache.outputs.cache-hit != 'true' && hashFiles('build-ios-xcode/CMakeCache.txt') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/CMakeCache.txt
+            build/CMakeFiles/[0-9]*
+            build-ios-xcode/CMakeCache.txt
+            build-ios-xcode/CMakeFiles/[0-9]*
+          key: cmake-ios-${{ steps.cache-setup.outputs.toolchain }}-${{ steps.cache-setup.outputs.cmake }}
+
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
@@ -102,7 +225,9 @@ jobs:
           path: out/XeniOS-dev-${{ env.SHORT_SHA }}.ipa
           retention-days: 7
 
+      # Only dev/** builds replace the IPA; xenios builds just warm the caches.
       - name: Publish rolling "dev-latest" pre-release
+        if: startsWith(github.ref, 'refs/heads/dev/')
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
