@@ -9,6 +9,7 @@
 
 #import <AVFoundation/AVFoundation.h>
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 
 #include <algorithm>
 #include <atomic>
@@ -87,6 +88,11 @@ DEFINE_bool(mount_memory_unit, false, "Enable memory unit (MU) mount", "Storage"
 DEFINE_bool(ios_emulator_thread_user_initiated_qos, false,
             "Run the iOS emulator host thread at user-initiated QoS. This is an "
             "iOS scheduler experiment for devices where guest CPU work falls behind.",
+            "iOS");
+DEFINE_bool(ios_pause_on_background, true,
+            "Pause emulation while XeniOS is in the background. iOS rejects GPU "
+            "work from background apps, which can leave the game on a black "
+            "screen after returning.",
             "iOS");
 
 // CVar normally defined in windowed_app_main_qt.cc (excluded on iOS).
@@ -525,6 +531,15 @@ class EmulatorAppIOS final : public xe::ui::WindowedApp {
   void EmulatorThread(const std::filesystem::path& game_path, bool require_cpu_backend);
   void ApplyGuestDisplayRefreshCapToWindowFromUIThread(bool capped);
   bool EnsureProfileServicesReady();
+  // Background pause. The notification handlers run on the main thread and
+  // hand the work to lifecycle_queue_, because Emulator::Pause waits for the
+  // GPU thread and must not block the main thread during the transition.
+  void SetUpBackgroundPause();
+  void TearDownBackgroundPause();
+  void OnEnterBackground();
+  void OnEnterForeground();
+  void PauseForBackground();
+  void ResumeFromBackground();
 
   static std::unique_ptr<apu::AudioSystem> CreateAudioSystem(cpu::Processor* processor);
   static std::unique_ptr<gpu::GraphicsSystem> CreateGraphicsSystem();
@@ -544,6 +559,11 @@ class EmulatorAppIOS final : public xe::ui::WindowedApp {
   bool title_update_install_in_progress_ = false;
   std::atomic<bool> emulator_initialized_{false};
   std::atomic<bool> emulator_cpu_initialized_{false};
+  dispatch_queue_t lifecycle_queue_ = nullptr;
+  id background_observer_ = nil;
+  id foreground_observer_ = nil;
+  // Only accessed on lifecycle_queue_.
+  bool paused_for_background_ = false;
 };
 
 bool EmulatorAppIOS::EnsureProfileServicesReady() {
@@ -566,6 +586,106 @@ void EmulatorAppIOS::ApplyGuestDisplayRefreshCapToWindowFromUIThread(bool capped
     return;
   }
   static_cast<ui::iOSWindow*>(window_.get())->SetGuestDisplayRefreshCapFromUIThread(capped);
+}
+
+void EmulatorAppIOS::SetUpBackgroundPause() {
+  lifecycle_queue_ = dispatch_queue_create("xenios.lifecycle", DISPATCH_QUEUE_SERIAL);
+  NSNotificationCenter* center = [NSNotificationCenter defaultCenter];
+  background_observer_ = [[center addObserverForName:UIApplicationDidEnterBackgroundNotification
+                                              object:nil
+                                               queue:nil
+                                          usingBlock:^(__unused NSNotification* notification) {
+                                            OnEnterBackground();
+                                          }] retain];
+  foreground_observer_ = [[center addObserverForName:UIApplicationWillEnterForegroundNotification
+                                              object:nil
+                                               queue:nil
+                                          usingBlock:^(__unused NSNotification* notification) {
+                                            OnEnterForeground();
+                                          }] retain];
+}
+
+void EmulatorAppIOS::TearDownBackgroundPause() {
+  NSNotificationCenter* center = [NSNotificationCenter defaultCenter];
+  if (background_observer_) {
+    [center removeObserver:background_observer_];
+    [background_observer_ release];
+    background_observer_ = nil;
+  }
+  if (foreground_observer_) {
+    [center removeObserver:foreground_observer_];
+    [foreground_observer_ release];
+    foreground_observer_ = nil;
+  }
+  if (lifecycle_queue_) {
+    // Wait for a pause in flight and undo it, so the title can be stopped.
+    dispatch_sync(lifecycle_queue_, ^{
+      ResumeFromBackground();
+    });
+    dispatch_release(lifecycle_queue_);
+    lifecycle_queue_ = nullptr;
+  }
+}
+
+void EmulatorAppIOS::OnEnterBackground() {
+  if (!cvars::ios_pause_on_background || !lifecycle_queue_) {
+    return;
+  }
+  // Ask iOS for time to finish pausing; the GPU thread may need a moment to
+  // reach the pause request.
+  UIApplication* application = [UIApplication sharedApplication];
+  __block UIBackgroundTaskIdentifier task = UIBackgroundTaskInvalid;
+  task = [application beginBackgroundTaskWithName:@"XeniOS pause"
+                                expirationHandler:^{
+                                  if (task != UIBackgroundTaskInvalid) {
+                                    [application endBackgroundTask:task];
+                                    task = UIBackgroundTaskInvalid;
+                                  }
+                                }];
+  dispatch_async(lifecycle_queue_, ^{
+    PauseForBackground();
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (task != UIBackgroundTaskInvalid) {
+        [application endBackgroundTask:task];
+        task = UIBackgroundTaskInvalid;
+      }
+    });
+  });
+}
+
+void EmulatorAppIOS::OnEnterForeground() {
+  if (!lifecycle_queue_) {
+    return;
+  }
+  // Always queued, even with the cvar off, so a pause done before the cvar
+  // was changed is still undone.
+  dispatch_async(lifecycle_queue_, ^{
+    ResumeFromBackground();
+  });
+}
+
+void EmulatorAppIOS::PauseForBackground() {
+  if (paused_for_background_ || shutting_down_.load(std::memory_order_acquire)) {
+    return;
+  }
+  Emulator* emulator = emulator_.get();
+  if (!emulator || !emulator->is_title_open() || emulator->is_paused()) {
+    return;
+  }
+  XELOGI("iOS lifecycle: pausing emulation while in background");
+  emulator->Pause();
+  paused_for_background_ = true;
+}
+
+void EmulatorAppIOS::ResumeFromBackground() {
+  if (!paused_for_background_) {
+    return;
+  }
+  paused_for_background_ = false;
+  if (emulator_) {
+    XELOGI("iOS lifecycle: resuming emulation after background");
+    emulator_->Resume();
+  }
 }
 
 std::filesystem::path EmulatorAppIOS::GetIOSStorageRoot() const {
@@ -1186,6 +1306,8 @@ bool EmulatorAppIOS::OnInitialize() {
     return WritePatchTextAtomically(storage_path, JoinPatchLines(lines), status_out);
   });
 
+  SetUpBackgroundPause();
+
   XELOGI("iOS: EmulatorAppIOS initialized successfully");
   return true;
 }
@@ -1286,6 +1408,7 @@ void EmulatorAppIOS::StartQueuedLaunchIfIdle() {
 void EmulatorAppIOS::OnDestroy() {
   XELOGI("iOS: EmulatorAppIOS::OnDestroy invoked");
   shutting_down_.store(true, std::memory_order_release);
+  TearDownBackgroundPause();
   auto& ios_context = static_cast<ui::IOSWindowedAppContext&>(app_context());
   ios_context.set_guest_display_refresh_cap_getter({});
   ios_context.set_guest_display_refresh_cap_setter({});

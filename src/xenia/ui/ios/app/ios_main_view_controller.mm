@@ -88,6 +88,11 @@
 DECLARE_bool(ios_touch_overlay);
 DECLARE_bool(present_letterbox);
 DECLARE_path(cache_root);
+DEFINE_bool(ios_keyboard_prompt_fallback, true,
+            "If the text prompt a game asks for (for example a character name) "
+            "can't be shown, retry for a few seconds and then return the game's "
+            "default text instead of leaving the game waiting forever.",
+            "iOS");
 
 using xe::ui::ApplyIOSCompatibilityDataToDiscoveredGames;
 using xe::ui::BuildDiscoveredGameFromPath;
@@ -1855,6 +1860,22 @@ static bool xe_clear_all_shader_caches(uintmax_t* removed_out, std::error_code* 
                                  description:(NSString*)description
                                  defaultText:(NSString*)default_text
                                   completion:(void (^)(BOOL cancelled, NSString* text))completion {
+  // The game thread waits until the completion runs, so it must run exactly
+  // once: from the alert's buttons, or from the fallback if it never shows.
+  __block BOOL finished = NO;
+  void (^finish)(BOOL, NSString*) = ^(BOOL cancelled, NSString* text) {
+    if (finished) {
+      return;
+    }
+    finished = YES;
+    if (completion) {
+      completion(cancelled, text);
+    }
+  };
+  BOOL (^is_finished)(void) = ^BOOL {
+    return finished;
+  };
+
   UIAlertController* alert =
       [UIAlertController alertControllerWithTitle:title.length ? title : @"Input Required"
                                           message:description
@@ -1869,25 +1890,65 @@ static bool xe_clear_all_shader_caches(uintmax_t* removed_out, std::error_code* 
   [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
                                             style:UIAlertActionStyleCancel
                                           handler:^(__unused UIAlertAction* action) {
-                                            if (completion) {
-                                              completion(YES, @"");
-                                            }
+                                            finish(YES, @"");
                                           }]];
   [alert addAction:[UIAlertAction actionWithTitle:@"OK"
                                             style:UIAlertActionStyleDefault
                                           handler:^(__unused UIAlertAction* action) {
                                             UITextField* text_field = alert.textFields.firstObject;
-                                            NSString* text = text_field.text ?: @"";
-                                            if (completion) {
-                                              completion(NO, text);
-                                            }
+                                            finish(NO, text_field.text ?: @"");
                                           }]];
 
+  XELOGI("iOS keyboard prompt: requested (title \"{}\")", title.length ? title.UTF8String : "");
+  [self presentKeyboardPromptAlert:alert
+                           attempt:0
+                      fallbackText:default_text ?: @""
+                            finish:finish
+                        isFinished:is_finished];
+}
+
+- (void)presentKeyboardPromptAlert:(UIAlertController*)alert
+                           attempt:(int)attempt
+                      fallbackText:(NSString*)fallback_text
+                            finish:(void (^)(BOOL cancelled, NSString* text))finish
+                        isFinished:(BOOL (^)(void))is_finished {
+  static constexpr int kMaxAttempts = 8;
+  static constexpr int64_t kCheckDelayNs = 750 * NSEC_PER_MSEC;
+
   UIViewController* presenter = self;
-  while (presenter.presentedViewController) {
+  while (presenter.presentedViewController && !presenter.presentedViewController.isBeingDismissed) {
     presenter = presenter.presentedViewController;
   }
-  [presenter presentViewController:alert animated:YES completion:nil];
+  if (presenter.view.window && !presenter.isBeingDismissed) {
+    [presenter presentViewController:alert
+                            animated:YES
+                          completion:^{
+                            XELOGI("iOS keyboard prompt: shown");
+                          }];
+  }
+  if (!cvars::ios_keyboard_prompt_fallback) {
+    return;
+  }
+
+  // UIKit refuses a presentation silently (it only logs a warning), which
+  // would leave the game waiting forever, so check that the alert appeared.
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kCheckDelayNs), dispatch_get_main_queue(), ^{
+    // Already answered (and dismissed), or currently shown.
+    if (is_finished() || alert.presentingViewController) {
+      return;
+    }
+    if (attempt + 1 < kMaxAttempts) {
+      XELOGW("iOS keyboard prompt: not shown, retrying ({}/{})", attempt + 2, kMaxAttempts);
+      [self presentKeyboardPromptAlert:alert
+                               attempt:attempt + 1
+                          fallbackText:fallback_text
+                                finish:finish
+                            isFinished:is_finished];
+      return;
+    }
+    XELOGW("iOS keyboard prompt: could not be shown, returning the default text");
+    finish(NO, fallback_text);
+  });
 }
 
 - (void)updateJITStatusIndicator {
