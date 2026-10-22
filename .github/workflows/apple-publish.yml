@@ -29,13 +29,8 @@ name: Apple Publish
         description: "Build number override (optional)"
         required: false
         type: string
-  push:
-    branches:
-      - "preview"
-      - "xenios"
-    tags:
-      - "v*"
-      - "release-*"
+  # Push triggers removed in this repo: publishing needs the official signing
+  # keys. iOS dev builds use ios-dev-build.yml instead.
 
 permissions:
   contents: write
