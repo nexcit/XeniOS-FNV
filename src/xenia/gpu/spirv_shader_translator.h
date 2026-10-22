@@ -42,7 +42,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 12;
+    static constexpr uint32_t kVersion = 13;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -307,6 +307,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
     // The constant blend factor for the respective modes.
     float edram_blend_constant[4];
+
+    // Integer num_format on fixed textures. Each dword packs the scale needed
+    // to turn normalized host samples back into guest integer values.
+    // bits 0:3 = component_bits - 1
+    // bit 4 = signed.
+    // Zero means no scale.
+    uint32_t texture_integer_scale_bits[32];
   };
 
   // Separate constant buffer for user clip planes
@@ -1000,6 +1007,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTKeepMask,
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
+    kSystemConstantTextureIntegerScaleBits,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_clip_plane_constants_;
